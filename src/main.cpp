@@ -746,11 +746,11 @@ unsigned int __stdcall MappingThreadProc(void* param) {
 		return -1;
 	}
 
-	// Notifica perguntando se deseja mapear ou ignorar
-	XNotifyUI(XNOTIFYUI_CUSTOM, L"Mapear controle? Deslize p/ DIREITA 3s (ou ignore)");
+	// Notifica com atalho inteligente perguntando se deseja mapear ou ignorar
+	XNotifyUI(XNOTIFYUI_CUSTOM, L"Configurar? Segure BACK+START 2s (ou ignore)");
 
-	// Aguarda ate 5 segundos monitorando o analogico para a direita
-	uint32_t rightHoldCount = 0;
+	// Aguarda ate 5 segundos monitorando o combo inteligente BACK + START ou analogico p/ direita
+	uint32_t holdCount = 0;
 	bool wantToMap = false;
 
 	for (int t = 0; t < 50; t++) { // 50 * 100ms = 5 segundos
@@ -758,19 +758,20 @@ unsigned int __stdcall MappingThreadProc(void* param) {
 		if (!g_mappingState.active)
 			break;
 
-		// Analogico esquerdo (x) ou analogico direito (z) inclinado para a direita (> 200) ou D-Pad direito (hat = 2)
+		// Atalho Inteligente: Combo BACK + START juntos OU analogico p/ direita (> 200)
 		int16_t xVal = controller->currentState.x;
 		int16_t zVal = controller->currentState.z;
-		bool heldRight = (xVal > 200 || zVal > 200 || controller->currentState.hatSwitch == 2);
+		bool isBackStart = ((controller->currentState.buttons & (XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START)) == (XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START));
+		bool heldTrigger = isBackStart || (xVal > 200 || zVal > 200 || controller->currentState.hatSwitch == 2);
 
-		if (heldRight) {
-			rightHoldCount++;
-			if (rightHoldCount >= 30) { // 30 * 100ms = 3 segundos continuos!
+		if (heldTrigger) {
+			holdCount++;
+			if (holdCount >= 20) { // 20 * 100ms = 2 segundos continuos!
 				wantToMap = true;
 				break;
 			}
 		} else {
-			rightHoldCount = 0;
+			holdCount = 0;
 		}
 	}
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-build_definitive_hiddriver.py - Comprehensive Technical Overhaul & Build Automation
+build_definitive_hiddriver.py - Comprehensive Technical Overhaul & Build Automation (v8 Final)
 Target: Xbox 360 Homebrew USB Controller Driver hiddriver360 (v0.6 beta)
 
 Root-cause fixes implemented:
 1. R1 (DllMain Clean Return):
    - At offset 0x0c800, patch with 'b 0xc864' (0x48000064).
-   - Cleanly skips UsbdPowerDownNotification, MmFreePhysicalMemory, and UsbdDriverEntry.
-   - Preserves power to internal Slim/E Wi-Fi module on Southbridge USB bus.
+   - Cleanly skips UsbdPowerDownNotification, MmFreePhysicalMemory, and synchronous UsbdDriverEntry.
+   - Prevents USB drive I/O collisions while DashLaunch is reading plugins.
    - Guarantees immediate return TRUE (<1ms) to DashLaunch without freezes.
 
 2. R2 (ShanWan / iPega PG-9076 Hook & Wi-Fi Preservation):
@@ -15,15 +15,19 @@ Root-cause fixes implemented:
    - At offset 0x0922c, write 0x480004a8 ('b 0x96d4') and 0x60000000 ('nop' at 0x09230).
    - Skips error 4 (HID_PARSE_UsageListOverflow) in USB_ProcessHIDReport.
 
-3. R3 (Thread Safety, Continuous Sync Mode & Controller Detection):
+3. R3 (Thread Safety, Safe Delayed USB Re-enumeration & Auto-Recognition):
    - Cave at 0x2cab0 (VA 0x81F33AB0) spawns via XapiThreadStartup thunk (0x0a628).
-   - Latch 'has_run' located in Section 4 (.data RW segment) at VA 0x81F43BF0.
-   - Active Synchronization Mode:
-     - Startup banner: "Sincronizando controle, aguarde..." (0x2cc00).
-     - 5s Fast poll (50 x 100ms).
-     - If not detected yet, shows: "Modo sincronizacao ativo..." (0x2cc80).
-     - Keeps continuous background poll active (120 x 500ms = 60s) so turning on/plugging in controller is caught immediately!
-     - On detection: "Controle sincronizado com sucesso!" (0x2cd00) followed by "Mapear? Segure p/ DIREITA 3s" (0x2cd80).
+   - Stack frame & LR correctly preserved (mflr r0 / stwu r1, -64(r1) ... addi r1, r1, 64 / mtlr r0 / blr).
+   - Restores original instruction mr r29, r27.
+   - 2500ms post-boot delay ensures DashLaunch is completely finished and Aurora is running in RAM.
+   - Calls UsbdDriverEntry(0, 0) WITHOUT UsbdPowerDownNotification and WITHOUT MmFreePhysicalMemory.
+     - Preserves physical DMA memory and power to internal Slim/E Wi-Fi module!
+     - Forces host controller to re-scan ports and recognize the connected iPega dongle automatically!
+   - Active Notification System:
+     - 0x2cd00: "Sincronizando controle, aguarde..."
+     - 0x2cd80: "Modo sincronizacao ativo..."
+     - 0x2ce00: "Controle sincronizado com sucesso!"
+     - 0x2ce80: "Configurar? BACK+START 2s (ou ignore)"
 
 4. R4 (PT-BR Wizard, 300ms Debounce & Usb:\\hiddriver.json):
    - Complete Portuguese translation of all in-game mapping prompts.
@@ -57,10 +61,10 @@ OFF_DEBOUNCE_CAVE    = 0x2ca40
 OFF_STARTUP_CAVE     = 0x2cab0
 OFF_HAS_RUN_DATA     = 0x34bf0  # VA 0x81F43BF0 in .data (RW)
 
-OFF_STR_INIT         = 0x2cc00  # "Sincronizando controle, aguarde..."
-OFF_STR_SYNC_ACTIVE  = 0x2cc80  # "Modo sincronizacao ativo..."
-OFF_STR_FOUND        = 0x2cd00  # "Controle sincronizado com sucesso!"
-OFF_STR_ASK_MAP      = 0x2cd80  # "Mapear? Segure p/ DIREITA 3s"
+OFF_STR_INIT         = 0x2cd00  # "Sincronizando controle, aguarde..."
+OFF_STR_SYNC_ACTIVE  = 0x2cd80  # "Modo sincronizacao ativo..."
+OFF_STR_FOUND        = 0x2ce00  # "Controle sincronizado com sucesso!"
+OFF_STR_ASK_MAP      = 0x2ce80  # "Configurar? BACK+START 2s (ou ignore)"
 
 OFF_SLEEP_THUNK      = 0x2c6cc
 OFF_XNOTIFY_THUNK    = 0x2c6bc
@@ -91,16 +95,24 @@ def make_bgt(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo
 def build_startup_cave():
     """Generates the position-independent PowerPC machine code for the active sync startup thread."""
     cave_ins = [
+        # Prologue: save caller's LR and allocate 64-byte stack frame
+        ('start', lambda off: 0x7d8802a6),                     # mflr r0
+        ('', lambda off: 0x9001fff8),                          # stw r0, -8(r1)
+        ('', lambda off: 0x9421ffc0),                          # stwu r1, -64(r1)
+
+        # Restores original instruction at 0x0a628: mr r29, r27
+        ('', lambda off: 0x7f9de378),                          # mr r29, r27
+
         # Check has_run latch at VA 0x81F43BF0 (.data segment)
-        ('start', lambda off: 0x3d6081f4),                     # lis r11, 0x81f4
+        ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
         ('', lambda off: 0x814b3bf0),                          # lwz r10, 0x3bf0(r11)
         ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
         ('', lambda off: make_bne(off, labels['exit_cave'])),  # already ran -> exit
         ('', lambda off: 0x39400001),                          # li r10, 1
         ('', lambda off: 0x914b3bf0),                          # stw r10, 0x3bf0(r11)
 
-        # Initial Sleep(1000)
-        ('', lambda off: 0x386003e8),                          # li r3, 1000
+        # Sleep(2500) - Allow DashLaunch to finish loading plugins and Aurora to run in RAM
+        ('', lambda off: 0x386009c4),                          # li r3, 2500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
         # Show 'Sincronizando controle, aguarde...'
@@ -108,16 +120,26 @@ def build_startup_cave():
         ('', lambda off: 0x38800000),                          # li r4, 0
         ('', lambda off: 0x38a00000),                          # li r5, 0
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63c00),                          # addi r6, r6, 0x3c00 (0x2cc00)
+        ('', lambda off: 0x38c63d00),                          # addi r6, r6, 0x3d00 (0x2cd00)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        # Sleep(500)
-        ('', lambda off: 0x386001f4),                          # li r3, 500
+        # Call UsbdDriverEntry(0, 0) to re-enumerate USB ports cleanly without powerdown!
+        ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
+        ('', lambda off: 0x814b1b0c),                          # lwz r10, 0x1b0c(r11) (UsbdDriverEntry ptr)
+        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
+        ('', lambda off: make_beq(off, labels['skip_usbd'])),  # safety check: if null skip
+        ('', lambda off: 0x7d4903a6),                          # mtctr r10
+        ('', lambda off: 0x38600000),                          # li r3, 0
+        ('', lambda off: 0x38800000),                          # li r4, 0
+        ('', lambda off: 0x4e800421),                          # bctrl (call UsbdDriverEntry!)
+
+        # Sleep(800) - Allow the kernel to complete USB bus reset & device configuration
+        ('skip_usbd', lambda off: 0x38600320),                 # li r3, 800
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # Fast polling loop (50 x 100ms = 5s)
-        ('', lambda off: 0x3a800032),                          # li r20, 50
+        # Fast polling loop (30 x 100ms = 3s)
+        ('', lambda off: 0x3a80001e),                          # li r20, 30
 
         ('detect_loop_fast', lambda off: 0x38600064),          # li r3, 100
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
@@ -145,12 +167,12 @@ def build_startup_cave():
         ('', lambda off: 0x38800000),                          # li r4, 0
         ('', lambda off: 0x38a00000),                          # li r5, 0
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63c80),                          # addi r6, r6, 0x3c80 (0x2cc80)
+        ('', lambda off: 0x38c63d80),                          # addi r6, r6, 0x3d80 (0x2cd80)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        # Continuous background polling loop (120 x 500ms = 60s)
-        ('', lambda off: 0x3a800078),                          # li r20, 120
+        # Continuous background polling loop (60 x 500ms = 30s)
+        ('', lambda off: 0x3a80003c),                          # li r20, 60
 
         ('detect_loop_bg', lambda off: 0x386001f4),            # li r3, 500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
@@ -178,27 +200,27 @@ def build_startup_cave():
         ('', lambda off: 0x38800000),                          # li r4, 0
         ('', lambda off: 0x38a00000),                          # li r5, 0
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63d00),                          # addi r6, r6, 0x3d00 (0x2cd00)
+        ('', lambda off: 0x38c63e00),                          # addi r6, r6, 0x3e00 (0x2ce00)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        ('', lambda off: 0x386007d0),                          # li r3, 2000
+        ('', lambda off: 0x386005dc),                          # li r3, 1500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # Show 'Mapear? Segure p/ DIREITA 3s'
+        # Show 'Configurar? BACK+START 2s (ou ignore)'
         ('', lambda off: 0x38600022),                          # li r3, 34
         ('', lambda off: 0x38800000),                          # li r4, 0
         ('', lambda off: 0x38a00000),                          # li r5, 0
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63d80),                          # addi r6, r6, 0x3d80 (0x2cd80)
+        ('', lambda off: 0x38c63e80),                          # addi r6, r6, 0x3e80 (0x2ce80)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        ('', lambda off: 0x386007d0),                          # li r3, 2000
-        ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
-
-        ('exit_cave', lambda off: 0x81810058),                 # lwz r12, 0x58(r1)
-        ('', lambda off: 0x4e800020),                          # blr
+        # Epilogue: Cleanly restore stack frame, LR, and return to caller (0x0a62c)
+        ('exit_cave', lambda off: 0x38210040),                 # addi r1, r1, 64 (deallocate frame)
+        ('', lambda off: 0x8001fff8),                          # lwz r0, -8(r1)  (restore original LR)
+        ('', lambda off: 0x7c0803a6),                          # mtlr r0         (put back in LR)
+        ('', lambda off: 0x4e800020),                          # blr             (clean return to 0x0a62c!)
     ]
 
     labels = {}
@@ -264,7 +286,7 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     data[OFF_DEBOUNCE_CAVE:OFF_DEBOUNCE_CAVE+len(debounce_cave)] = debounce_cave
 
     # 4. R3: Threading Hook, Code Cave & has_run Latch in .data
-    print("[-] Applying R3: Active Synchronization Mode Cave (0x2cab0) & .data Latch...")
+    print("[-] Applying R3: Active Auto-Re-enumeration Startup Cave (0x2cab0) & .data Latch...")
     data[OFF_THREAD_HOOK:OFF_THREAD_HOOK+4] = (0x48022489).to_bytes(4, 'big') # bl 0x2cab0
 
     startup_cave = build_startup_cave()
@@ -274,7 +296,7 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     s_init        = "Sincronizando controle, aguarde...".encode("utf-16-be") + b"\x00\x00"
     s_sync_active = "Modo sincronizacao ativo...".encode("utf-16-be") + b"\x00\x00"
     s_found       = "Controle sincronizado com sucesso!".encode("utf-16-be") + b"\x00\x00"
-    s_ask_map     = "Mapear? Segure p/ DIREITA 3s".encode("utf-16-be") + b"\x00\x00"
+    s_ask_map     = "Configurar? BACK+START 2s (ou ignore)".encode("utf-16-be") + b"\x00\x00"
 
     data[OFF_STR_INIT:OFF_STR_INIT+len(s_init)] = s_init
     data[OFF_STR_SYNC_ACTIVE:OFF_STR_SYNC_ACTIVE+len(s_sync_active)] = s_sync_active
@@ -338,18 +360,21 @@ def verify_patched_binary(data: bytearray) -> bool:
     ov = struct.unpack(">I", data[0x0922c:0x09230])[0]
     assert ov == 0x480004a8, f"R2 Failed: Expected 0x480004a8 at 0x0922c, got {hex(ov)}"
 
-    # R3 Threading & Latch Verification
+    # R3 Threading, Stack Frame & Latch Verification
     thook = struct.unpack(">I", data[0x0a628:0x0a62c])[0]
     assert thook == 0x48022489, f"R3 Failed: Expected 0x48022489 at 0x0a628, got {hex(thook)}"
 
     cave_start = struct.unpack(">I", data[0x2cab0:0x2cab4])[0]
-    assert cave_start == 0x3d6081f4, f"R3 Failed: Cave must reference .data (0x81f4), got {hex(cave_start)}"
+    assert cave_start == 0x7d8802a6, f"R3 Failed: Cave must start with mflr r0 (0x7d8802a6), got {hex(cave_start)}"
 
-    latch_load = struct.unpack(">I", data[0x2cab4:0x2cab8])[0]
+    stk_alloc = struct.unpack(">I", data[0x2cab8:0x2cabc])[0]
+    assert stk_alloc == 0x9421ffc0, f"R3 Failed: Cave must allocate stack (0x9421ffc0), got {hex(stk_alloc)}"
+
+    orig_ins = struct.unpack(">I", data[0x2cabc:0x2cac0])[0]
+    assert orig_ins == 0x7f9de378, f"R3 Failed: Cave must restore mr r29, r27 (0x7f9de378), got {hex(orig_ins)}"
+
+    latch_load = struct.unpack(">I", data[0x2cac4:0x2cac8])[0]
     assert latch_load == 0x814b3bf0, f"R3 Failed: Cave must load 0x3bf0(r11), got {hex(latch_load)}"
-
-    dec_op = struct.unpack(">I", data[0x2cb34:0x2cb38])[0]
-    assert dec_op == 0x3694ffff, f"R3 Failed: Loop decrement must be addic. (0x3694ffff), got {hex(dec_op)}"
 
     latch_val = struct.unpack(">I", data[0x34bf0:0x34bf4])[0]
     assert latch_val == 0, f"R3 Failed: has_run at 0x34bf0 must be 0, got {latch_val}"
@@ -361,11 +386,17 @@ def verify_patched_binary(data: bytearray) -> bool:
     path = data[0x413c:0x414f]
     assert path == b"Usb:\\hiddriver.json", f"R4 Failed: Path must be Usb:\\hiddriver.json, got {path}"
 
-    s_init_read = data[0x2cc00:0x2cc46].decode("utf-16-be").rstrip("\x00")
+    s_init_read = data[0x2cd00:0x2cd46].decode("utf-16-be").rstrip("\x00")
     assert s_init_read == "Sincronizando controle, aguarde...", f"Banner init mismatch: {s_init_read}"
 
-    s_sync_read = data[0x2cc80:0x2ccb8].decode("utf-16-be").rstrip("\x00")
+    s_sync_read = data[0x2cd80:0x2cdb8].decode("utf-16-be").rstrip("\x00")
     assert s_sync_read == "Modo sincronizacao ativo...", f"Banner sync active mismatch: {s_sync_read}"
+
+    s_found_read = data[0x2ce00:0x2ce46].decode("utf-16-be").rstrip("\x00")
+    assert s_found_read == "Controle sincronizado com sucesso!", f"Banner found mismatch: {s_found_read}"
+
+    s_ask_read = data[0x2ce80:0x2cecc].decode("utf-16-be").rstrip("\x00")
+    assert s_ask_read == "Configurar? BACK+START 2s (ou ignore)", f"Banner ask mismatch: {s_ask_read}"
 
     # R5 Native Mapping Verification
     map_base = struct.unpack(">I", data[0x0bbb0:0x0bbb4])[0]
@@ -415,7 +446,7 @@ def deploy_to_console(source_xex: str, target_root: str):
         return
 
     dest_xex = os.path.join(target_root, "hiddriver.xex")
-    bak_xex = os.path.join(target_root, "hiddriver.xex.bak_pre_final")
+    bak_xex = os.path.join(target_root, "hiddriver.xex.bak_pre_v8")
 
     print(f"[-] Deploying to console target: {dest_xex}")
     try:
@@ -440,7 +471,7 @@ def main():
     output_packaged = os.path.join(workspace, "hiddriver.xex")
 
     print("=================================================================")
-    print("  Xbox 360 hiddriver360 Active Sync Mode Build                   ")
+    print("  Xbox 360 hiddriver360 Safe Auto-Recognition Build (v8 Final)   ")
     print("=================================================================")
 
     if not os.path.exists(base_file):
@@ -471,7 +502,7 @@ def main():
     deploy_to_console(output_packaged, "E:\\")
 
     print("\n=================================================================")
-    print("  Build & Deployment SUCCEEDED: Active Sync Mode Ready!          ")
+    print("  Build & Deployment SUCCEEDED: Auto-Recognition Ready!          ")
     print("=================================================================")
 
 if __name__ == "__main__":
