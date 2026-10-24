@@ -1,0 +1,36 @@
+[
+  {
+    "vid": 9571,
+    "pid": 1397,
+    "comment": "iPega PG-9076 / ShanWan PS3 PC Android Wireless Gamepad (2.4G Mode)",
+    "axes": [
+      { "usage": 48, "field": "x" },
+      { "usage": 49, "field": "y" },
+      { "usage": 50, "field": "z" },
+      { "usage": 53, "field": "rz" }
+    ],
+    "buttons": [
+      { "idx": 1, "field": "a_button" },
+      { "idx": 2, "field": "b_button" },
+      { "idx": 0, "field": "x_button" },
+      { "idx": 3, "field": "y_button" },
+      { "idx": 4, "field": "l1" },
+      { "idx": 5, "field": "r1" },
+      { "idx": 6, "field": "l2" },
+      { "idx": 7, "field": "r2" },
+      { "idx": 8, "field": "back" },
+      { "idx": 9, "field": "start" },
+      { "idx": 10, "field": "l3" },
+      { "idx": 11, "field": "r3" },
+      { "idx": 12, "field": "xbox" }
+    ],
+    "invert": {
+      "x": false,
+      "y": true,
+      "z": false,
+      "rx": false,
+      "ry": false,
+      "rz": true
+    }
+  }
+]

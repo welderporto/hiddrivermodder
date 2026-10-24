@@ -1,47 +1,56 @@
 # hiddrivermodder 🎮 (Xbox 360)
 
-Modificação personalizada do **[hiddriver360](https://github.com/EinTim23/hiddriver360)** (desenvolvido originalmente por **EinTim23**), adicionando detecção otimizada com janela responsiva de 5 segundos, re-enumeração USB nativa segura sem queda de Wi-Fi no Xbox 360 Slim/E, suporte expandido a controles USB/Wireless genéricos (como ShanWan / iPega PG-9076), assistente de mapeamento interativo 100% em **Português (PT-BR)** e otimização de sensibilidade de clique.
+Modificação personalizada e definitiva do **[hiddriver360](https://github.com/EinTim23/hiddriver360)** (desenvolvido originalmente por **EinTim23**), adicionando:
+* Suporte nativo embutido a controles **ShanWan / iPega PG-9076** (`2563:0575`).
+* Preservação total da placa interna de **Wi-Fi** no Xbox 360 Slim/E (sem quedas nem travamentos no boot).
+* Notificação visual de inicialização e detecção em 5 segundos (`Iniciando o hiddriver, aguarde...`).
+* Assistente de mapeamento interativo 100% em **Português (PT-BR)** com debounce de 300 ms.
+* **Ferramenta & Prompt de Inteligência Artificial** para identificar e compatibilizar qualquer controle USB genérico.
 
 ---
 
-## ✨ Melhorias e Modificações (v5.0)
+## ✨ Melhorias e Modificações Definitivas
 
-### 1. 🔔 Notificação de Inicialização e Detecção em 5 Segundos
-* **Feedback Visual Imediato:** Assim que o console conclui a inicialização e o driver sobe, é exibida a notificação na tela:
+### 1. 🎮 Suporte Nativo ao iPega PG-9076 / ShanWan (`2563:0575`)
+* **Mapeamento Estático Embutido:** O dispositivo foi adicionado diretamente à tabela nativa de controles do driver com todos os 13 botões (A, B, X, Y, LB, RB, LT, RT, Back, Start, L3, R3, Guia Xbox) e 4 eixos (analógicos esquerdo e direito com inversão vertical precisa).
+* **Plug & Play Instantâneo:** Ao conectar o receptor USB 2.4G e ligar o controle no modo `L1 + Home`, ele é reconhecido de imediato pelo console como o Controle 1 (XAM), sem exigir assistente de mapeamento.
+* **Correção de Overflow HID:** O parser original possuía limite de pilha de 8 Usages. O iPega reporta 12 usages consecutivos, gerando erro `HID_PARSE_UsageListOverflow` (código 4). O patch binário descarta o excedente com segurança.
+
+### 2. 📶 Preservação Definitiva do Wi-Fi (Xbox 360 Slim / E)
+* **A Causa do Problema:** No `hiddriver` original, o `DllMain` executava um reset bruto no barramento USB (`UsbdPowerDownNotification` + `UsbdDriverEntry`) para forçar o kernel a re-detectar controles já espetados. Como a placa de Wi-Fi interna dos modelos Slim e E fica no mesmo barramento USB interno, ela perdia energia e parava de funcionar.
+* **A Solução:** O reset destrutivo foi substituído por um desvio limpo (`b 0xc864`) que preserva os controladores de host USB e a placa de Wi-Fi sem jamais desligá-los. O console inicia com Wi-Fi 100% operacional e sem qualquer congelamento.
+
+### 3. 🔔 Notificação Visual de Inicialização (PT-BR)
+* **Feedback Imediato:** Assim que o plugin sobe no boot, exibe o aviso:
   `🔔 "Iniciando o hiddriver, aguarde..."`
-* **Janela Ágil de 5 Segundos:** O driver realiza uma checagem rápida de até 5 segundos (50 iterações de 100 ms) verificando as portas USB.
-* **Resultado e Trava Única:**
-  * Se o controle estiver conectado ou for ligado: `🔔 "Controle identificado!"` (iniciando o uso ou o assistente).
-  * Se o tempo expirar sem nenhum controle: `🔔 "Nenhum controle identificado!"`.
-  * **Trava de execução única (`has_run`):** O processo de inicialização ocorre apenas uma vez no boot, mantendo a thread de fundo totalmente livre para reconhecer controles conectados a quente posteriormente.
+* **Checagem de 5 Segundos:** Verifica a presença de controles conectados nas portas USB. Se identificado: `🔔 "Controle identificado!"`. Caso contrário, avisa `🔔 "Nenhum controle identificado!"`.
+* **Thread Segura & Latch:** A variável de controle foi alocada na seção de dados graváveis (`.data`), garantindo execução limpa sem exceções de interrupção DSI.
 
-### 2. 📶 Re-enumeração Segura e Correção do Wi-Fi (Xbox 360 Slim / E)
-* **O Problema Histórico:** No código original, o driver executava um reset forçado do barramento (`UsbdPowerDownNotification`), cortando a alimentação dos hubs USB. Como nos modelos Slim e Super Slim (E) a **placa interna de Wi-Fi é conectada ao barramento USB interno**, esse corte derrubava a placa sem fio permanentemente.
-* **A Solução v5.0 Definitiva:** O driver agora utiliza a API oficial da Microsoft para drivers de acessórios: **`UsbdTitleDriverResetAllUnrecognizedPorts` (Ordinal 890 do `xboxkrnl.exe`)**.
-  * Apenas portas com dispositivos não identificados (como o dongle USB do controle) recebem sinal de reset.
-  * A porta interna da placa de Wi-Fi **jamais é tocada nem desligada**.
-  * **Resultado:** O Wi-Fi funciona continuamente sem jamais cair, e o controle iPega/ShanWan é detectado perfeitamente!
-
-### 3. 🎮 Suporte a Controles ShanWan / iPega PG-9076 (`2563:0575`)
-* **Problema no original:** O parser HID nativo do `hiddriver360` possui uma pilha máxima de 8 Usages (`HID_USAGE_STACK_DEPTH = 8`). Dispositivos como o iPega PG-9076 (ShanWan Wireless) reportam sequências de até 12 vendor usages seguidos, gerando o erro silencioso `HID_PARSE_UsageListOverflow` (código 4) e travando a inicialização do controle.
-* **Solução:** Patch binário em `0x81f1022c` (`b 0x81f106d4`) instruindo o parser a descartar o excedente seguro em vez de abortar o dispositivo.
-
-### 4. 🇧🇷 Assistente de Mapeamento em Português (PT-BR)
-* Todas as notificações na interface do console (`XNotifyUI`) e nomes dos botões foram traduzidos e adaptados para o Português Brasileiro:
-  * Mensagem de boas-vindas com nome do controle identificado.
-  * Instruções passo a passo: `Aperte o botão A`, `Aperte o Gatilho Direito (RT)`, `Gire o Analógico Esquerdo`, etc.
-  * Mensagens de confirmação e salvamento de perfil.
-
-### 5. ⚡ Sensibilidade de Clique Responsiva (Timing Otimizado)
-* **Problema:** Na versão original havia uma pausa bloqueante de 5 segundos que fazia a thread dormir e descartar cliques, forçando o usuário a pressionar o botão repetidas vezes até registrar.
-* **Solução:** Substituído por um debounce leve de **300 ms** (apenas o suficiente para o banner de notificação subir e evitar repiques elétricos). A leitura do botão agora é imediata no **primeiro clique**!
+### 4. 🇧🇷 Assistente de Mapeamento em Português & 300ms Debounce
+* Todas as mensagens na interface do console (`XNotifyUI`) traduzidas para o Português Brasileiro.
+* Debounce ajustado de 5s para **300 ms**, registrando o clique do botão na primeira pressão.
+* Configurações salvas automaticamente em `Usb:\hiddriver.json`.
 
 ---
 
-## 📦 Como Usar no Xbox 360
+## 🤖 Quer Adicionar Outro Controle Usando IA?
 
-1. Copie o arquivo `bin/hiddriver.xex` para a raiz do seu pendrive USB (`Usb:\hiddriver.xex`).
-2. No seu arquivo `launch.ini`, carregue o plugin:
+Disponibilizamos um fluxo automático completo para você usar qualquer IA (ChatGPT, Gemini, Claude, Antigravity) para deixar seu controle genérico compatível:
+
+1. Conecte o seu controle USB ou receptor sem fio no computador.
+2. Execute o diagnosticador automático:
+   ```powershell
+   python tools/identificar_controle.py
+   ```
+3. O script lerá o **VID**, **PID** e o **HID Report Descriptor** do controle e gerará o prompt pronto para você copiar!
+4. Veja as instruções completas no arquivo: **[PROMPT_IA_COMPATIBILIZAR_CONTROLE.md](PROMPT_IA_COMPATIBILIZAR_CONTROLE.md)**.
+
+---
+
+## 📦 Como Instalar no Xbox 360
+
+1. Copie o arquivo `bin/hiddriver.xex` e `hiddriver.json` para a raiz do seu pendrive USB (`Usb:\`).
+2. No seu arquivo `launch.ini`, mantenha o plugin configurado:
 ```ini
 [Plugins]
 plugin1 = Usb:\Xbdm.xex
@@ -49,14 +58,13 @@ plugin2 = Usb:\hiddriver.xex
 plugin3 = Usb:\JRPC2.xex
 plugin4 = Usb:\NetISO.xex
 ```
-3. Reinicie o console com o pendrive conectado.
-4. Conecte o receptor USB do seu controle iPega / ShanWan em uma porta USB do Xbox 360.
-5. Ligue o controle (no iPega PG-9076, segure `Home + X` até sincronizar com o dongle).
-6. Assim que a notificação `Iniciando o hiddriver, aguarde...` e `Controle identificado!` surgirem, siga o assistente na tela para mapear os botões na primeira vez.
-7. As configurações são salvas automaticamente em `Usb:\hiddriver.json`.
+3. Ligue o console.
+4. Conecte o receptor USB do controle (ou plugue-o após o boot).
+5. Ligue o controle iPega PG-9076 segurando **`L1` + `HOME`** por 3 segundos (os LEDs 1 e 2 permanecerão acesos fixos).
+6. O controle funcionará imediatamente no Dashboard e nos jogos!
 
 ---
 
 ## 🛠️ Créditos
 * **[EinTim23](https://github.com/EinTim23/hiddriver360)** - Criador do projeto original `hiddriver360`.
-* **Welder Porto ([soldadorporto](https://github.com/welderporto))** - Engenharia reversa, correção definitiva do bug de Wi-Fi via Ordinal 890, patches binários, tradução PT-BR e ajustes de timing.
+* **Welder Porto ([welderporto](https://github.com/welderporto))** - Engenharia reversa, correção de Wi-Fi, mapeamento nativo iPega PG-9076, tradução PT-BR, thread segura e integração de IA.
