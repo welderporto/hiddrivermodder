@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-build_definitive_hiddriver.py - Comprehensive Technical Overhaul & Build Automation (v10 Stable Definitive)
+build_definitive_hiddriver.py - Comprehensive Technical Overhaul & Build Automation (v11 Analog Sync Trigger)
 Target: Xbox 360 Homebrew USB Controller Driver hiddriver360 (v0.6 beta)
 
 Root-cause fixes implemented:
@@ -23,15 +23,21 @@ Root-cause fixes implemented:
      - 0x2cd00: "Sincronizando controle, aguarde..."
      - 0x2cd80: "Modo sincronizacao ativo..."
      - 0x2ce00: "Controle sincronizado com sucesso!"
-     - 0x2ce80: "Configurar? BACK+START 2s (ou ignore)"
-   - Background polling: checks controllers immediately and continues for 30s in background.
+     - 0x2ce80: "Mapear? Analog.Esq p/ Esq 3s"
 
-4. R4 (PT-BR Wizard, 300ms Debounce & Usb:\hiddriver.json):
+4. Analog Sync Trigger Cave (0x2cc20):
+   - Hooked at offset 0x0a648 in MappingManagerThreadProc via 'b 0x2cc20' (preserves LR completely).
+   - Continuously monitors if the Left Analog Stick is held to the LEFT (or L3 pressed) for 3 seconds.
+   - When held for 3s (30 ticks x 100ms), sets connectedControllers[i].map = NULL (0(r31) = 0) and r11 = 0.
+   - Falls through to spawn MappingThreadProc, activating the PT-BR mapping/synchronization wizard!
+   - Cleanly branches back to 0x0a64c with zero stack touch and zero register corruption.
+
+5. R4 (PT-BR Wizard, 300ms Debounce & Usb:\hiddriver.json):
    - Complete Portuguese translation of all in-game mapping prompts.
    - 300ms button-press debounce logic in code caves 0x2ca40..0x2ca98.
    - Configuration persistence redirected to 'Usb:\hiddriver.json' at offset 0x413c.
 
-5. R5 (Native iPega PG-9076 / ShanWan Hardware Support):
+6. R5 (Native iPega PG-9076 / ShanWan Hardware Support):
    - VID 0x2563, PID 0x0575 injected into expanded static mapping table at VA 0x81F43C00.
    - Full 13-button mapping table at VA 0x81F43CC0 (A, B, X, Y, LB, RB, LT, RT, Back, Start, L3, R3, Guide).
    - Inlined FindStaticMapping patched to scan 8 entries (0xc0 bytes) at VA 0x81F43C00.
@@ -50,18 +56,22 @@ OFF_PTBR_BLOCK_END   = 0x04198
 OFF_USAGE_OVERFLOW   = 0x0922c
 OFF_DLLMAIN_RESET    = 0x0c800
 OFF_THREAD_HOOK      = 0x0a628
+OFF_STICK_HOOK       = 0x0a648  # b 0x2cc20 (Analog Stick Left 3s Trigger)
+OFF_STICK_RETURN     = 0x0a64c  # cmplwi cr6, r11, 0
 OFF_WIZARD_HOOK_1    = 0x0a75c
 OFF_WIZARD_HOOK_2    = 0x0ab6c
 OFF_WIZARD_HOOK_3    = 0x0ad54
 
 OFF_DEBOUNCE_CAVE    = 0x2ca40
 OFF_STARTUP_CAVE     = 0x2cab0
+OFF_STICK_CAVE       = 0x2cc20
 OFF_HAS_RUN_DATA     = 0x34bf0  # VA 0x81F43BF0 in .data (RW)
+OFF_STICK_CNT_DATA   = 0x34bf4  # VA 0x81F43BF4 in .data (RW)
 
 OFF_STR_INIT         = 0x2cd00  # "Sincronizando controle, aguarde..."
 OFF_STR_SYNC_ACTIVE  = 0x2cd80  # "Modo sincronizacao ativo..."
 OFF_STR_FOUND        = 0x2ce00  # "Controle sincronizado com sucesso!"
-OFF_STR_ASK_MAP      = 0x2ce80  # "Configurar? BACK+START 2s (ou ignore)"
+OFF_STR_ASK_MAP      = 0x2ce80  # "Mapear? Analog.Esq p/ Esq 3s"
 
 OFF_SLEEP_THUNK      = 0x2c6cc
 OFF_XNOTIFY_THUNK    = 0x2c6bc
@@ -88,6 +98,7 @@ def make_b(from_off, to_off): return assemble_branch(from_off, to_off, lk=False)
 def make_beq(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=12, bi=2)
 def make_bne(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=4, bi=2)
 def make_bgt(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=12, bi=1)
+def make_blt(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=12, bi=0)
 
 def build_startup_cave():
     """Generates verified PowerPC machine code for the startup auto-recognition & sync cave."""
@@ -189,7 +200,7 @@ def build_startup_cave():
         ('', lambda off: 0x386005dc),                          # li r3, 1500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # Show 'Configurar? BACK+START 2s (ou ignore)'
+        # Show 'Mapear? Analog.Esq p/ Esq 3s'
         ('', lambda off: 0x38600050),                          # li r3, 0x50
         ('', lambda off: 0x388000ff),                          # li r4, 0xff
         ('', lambda off: 0x38a00001),                          # li r5, 1
@@ -224,6 +235,70 @@ def build_startup_cave():
         cur_off += 4
 
     return bytes(machine_code)
+
+def build_stick_cave():
+    """
+    Generates PowerPC machine code at 0x2cc20 for Left Analog Stick to Left (3s) trigger.
+    Hooked at 0x0a648 (replaces 'lwz r11, 0(r31)').
+    Branches back to 0x0a64c ('cmplwi cr6, r11, 0') with LR untouched.
+    """
+    cave_ins = [
+        # 1. Load current mapping into r11 (original instruction at 0x0a648)
+        ('start', lambda off: 0x817f0000),                     # lwz r11, 0(r31)
+        ('', lambda off: 0x280b0000),                          # cmplwi r11, 0
+        ('', lambda off: make_beq(off, labels['exit_cave'])),  # if map == NULL, exit
+
+        # 2. Check if Left Stick is tilted to the LEFT:
+        # currentState.x high byte is at -0x37(r31)
+        ('', lambda off: 0x895fffc9),                          # lbz r10, -0x37(r31)
+        ('', lambda off: 0x7d4a0774),                          # extsb r10, r10 (sign extend 8-bit to 32-bit)
+        ('', lambda off: 0x2c0affd8),                          # cmpwi r10, -40
+        ('', lambda off: make_blt(off, labels['held_left'])),  # if r10 < -40 -> held_left
+
+        # 3. Check L3 button at -0x21(r31)
+        ('', lambda off: 0x891fffdf),                          # lbz r8, -0x21(r31)
+        ('', lambda off: 0x28080001),                          # cmplwi r8, 1
+        ('', lambda off: make_beq(off, labels['held_left'])),  # if l3 == 1 -> held_left
+
+        # 4. Neither: reset counter to 0
+        ('', lambda off: 0x3d2081f4),                          # lis r9, 0x81f4
+        ('', lambda off: 0x39000000),                          # li r8, 0
+        ('', lambda off: 0x91093bf4),                          # stw r8, 0x3bf4(r9)
+        ('', lambda off: make_b(off, labels['exit_cave'])),
+
+        # 5. Held left: increment counter
+        ('held_left', lambda off: 0x3d2081f4),                 # lis r9, 0x81f4
+        ('', lambda off: 0x81093bf4),                          # lwz r8, 0x3bf4(r9)
+        ('', lambda off: 0x39080001),                          # addi r8, r8, 1
+        ('', lambda off: 0x91093bf4),                          # stw r8, 0x3bf4(r9)
+        ('', lambda off: 0x2808001e),                          # cmplwi r8, 30 (30 * 100ms = 3.0s)
+        ('', lambda off: make_blt(off, labels['exit_cave'])),  # if < 30 -> exit
+
+        # 6. Reached 3 seconds! Reset counter, clear map, set r11 = 0
+        ('', lambda off: 0x39000000),                          # li r8, 0
+        ('', lambda off: 0x91093bf4),                          # stw r8, 0x3bf4(r9)
+        ('', lambda off: 0x911f0000),                          # stw r8, 0(r31) (map = NULL)
+        ('', lambda off: 0x39600000),                          # li r11, 0 (triggers wizard!)
+
+        # 7. Exit: return to 0x0a64c (cmplwi cr6, r11, 0)
+        ('exit_cave', lambda off: make_b(off, OFF_STICK_RETURN)),
+    ]
+
+    labels = {}
+    cur_off = OFF_STICK_CAVE
+    for label, _ in cave_ins:
+        if label:
+            labels[label] = cur_off
+        cur_off += 4
+
+    mc = bytearray()
+    cur_off = OFF_STICK_CAVE
+    for _, gen in cave_ins:
+        ins = gen(cur_off)
+        mc.extend(ins.to_bytes(4, 'big'))
+        cur_off += 4
+
+    return bytes(mc)
 
 def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     """Applies all root-cause technical overhaul patches to the uncompressed XEX."""
@@ -271,27 +346,32 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     )
     data[OFF_DEBOUNCE_CAVE:OFF_DEBOUNCE_CAVE+len(debounce_cave)] = debounce_cave
 
-    # 4. R3: Threading Hook, Startup Cave & .data Latch
-    print("[-] Applying R3: Safe Startup Sync Cave (0x2cab0) & .data Latch...")
+    # 4. R3: Threading Hook, Startup Cave, Analog Stick Cave & .data Latches
+    print("[-] Applying R3: Safe Startup Sync Cave (0x2cab0) & Stick Cave (0x2cc20)...")
     data[OFF_THREAD_HOOK:OFF_THREAD_HOOK+4] = make_bl(OFF_THREAD_HOOK, OFF_STARTUP_CAVE).to_bytes(4, 'big')
+    data[OFF_STICK_HOOK:OFF_STICK_HOOK+4]   = make_b(OFF_STICK_HOOK, OFF_STICK_CAVE).to_bytes(4, 'big')
 
     startup_cave = build_startup_cave()
-    assert OFF_STARTUP_CAVE + len(startup_cave) <= OFF_STR_INIT, "Startup cave overlaps notification strings!"
+    assert OFF_STARTUP_CAVE + len(startup_cave) <= OFF_STICK_CAVE, "Startup cave overlaps stick cave!"
     data[OFF_STARTUP_CAVE:OFF_STARTUP_CAVE+len(startup_cave)] = startup_cave
+
+    stick_cave = build_stick_cave()
+    assert OFF_STICK_CAVE + len(stick_cave) <= OFF_STR_INIT, "Stick cave overlaps notification strings!"
+    data[OFF_STICK_CAVE:OFF_STICK_CAVE+len(stick_cave)] = stick_cave
 
     # UTF-16BE Notification Strings
     s_init        = "Sincronizando controle, aguarde...".encode("utf-16-be") + b"\x00\x00"
     s_sync_active = "Modo sincronizacao ativo...".encode("utf-16-be") + b"\x00\x00"
     s_found       = "Controle sincronizado com sucesso!".encode("utf-16-be") + b"\x00\x00"
-    s_ask_map     = "Configurar? BACK+START 2s (ou ignore)".encode("utf-16-be") + b"\x00\x00"
+    s_ask_map     = "Mapear? Analog.Esq p/ Esq 3s".encode("utf-16-be") + b"\x00\x00"
 
     data[OFF_STR_INIT:OFF_STR_INIT+len(s_init)] = s_init
     data[OFF_STR_SYNC_ACTIVE:OFF_STR_SYNC_ACTIVE+len(s_sync_active)] = s_sync_active
     data[OFF_STR_FOUND:OFF_STR_FOUND+len(s_found)] = s_found
     data[OFF_STR_ASK_MAP:OFF_STR_ASK_MAP+len(s_ask_map)] = s_ask_map
 
-    # Clear has_run latch (0x81F43BF0) in .data
-    data[OFF_HAS_RUN_DATA:OFF_HAS_RUN_DATA+4] = bytes(4)
+    # Clear has_run latch (0x81F43BF0) and stick counter (0x81F43BF4) in .data
+    data[OFF_HAS_RUN_DATA:OFF_HAS_RUN_DATA+8] = bytes(8)
 
     # 5. R5: Native iPega PG-9076 / ShanWan (VID 0x2563, PID 0x0575) Static Mapping
     print("[-] Applying R5: Native iPega PG-9076 (VID 0x2563, PID 0x0575) Static Mapping...")
@@ -355,9 +435,10 @@ def verify_patched_binary(data: bytearray) -> bool:
     thook = struct.unpack(">I", data[0x0a628:0x0a62c])[0]
     assert thook == 0x48022489, f"R3 Failed: Expected 0x48022489 at 0x0a628, got {hex(thook)}"
 
-    # Check 0x0a648 is UNTOUCHED (lwz r11, 0(r31))
-    chook = struct.unpack(">I", data[0x0a648:0x0a64c])[0]
-    assert chook == 0x817f0000, f"R3 Failed: Expected original 0x817f0000 at 0x0a648, got {hex(chook)}"
+    # Check 0x0a648 is hooked to stick cave via 'b 0x2cc20'
+    expected_stick_hook = make_b(OFF_STICK_HOOK, OFF_STICK_CAVE)
+    shook = struct.unpack(">I", data[0x0a648:0x0a64c])[0]
+    assert shook == expected_stick_hook, f"Stick Hook Failed: Expected {hex(expected_stick_hook)}, got {hex(shook)}"
 
     cave_start = struct.unpack(">I", data[0x2cab0:0x2cab4])[0]
     assert cave_start == 0x3d6081f4, f"R3 Failed: Cave must start with lis r11, 0x81f4 (0x3d6081f4), got {hex(cave_start)}"
@@ -387,8 +468,8 @@ def verify_patched_binary(data: bytearray) -> bool:
     s_found_read = data[0x2ce00:0x2ce46].decode("utf-16-be").rstrip("\x00")
     assert s_found_read == "Controle sincronizado com sucesso!", f"Banner found mismatch: {s_found_read}"
 
-    s_ask_read = data[0x2ce80:0x2cecc].decode("utf-16-be").rstrip("\x00")
-    assert s_ask_read == "Configurar? BACK+START 2s (ou ignore)", f"Banner ask mismatch: {s_ask_read}"
+    s_ask_read = data[0x2ce80:0x2cebe].decode("utf-16-be").rstrip("\x00")
+    assert s_ask_read == "Mapear? Analog.Esq p/ Esq 3s", f"Banner ask mismatch: {s_ask_read}"
 
     # R5 Native Mapping Verification
     map_base = struct.unpack(">I", data[0x0bbb0:0x0bbb4])[0]
@@ -457,7 +538,7 @@ def main():
     output_packaged = os.path.join(workspace, "hiddriver.xex")
 
     print("=================================================================")
-    print("  Xbox 360 hiddriver360 Rock-Solid Stable Build (v10 Final)      ")
+    print(" Xbox 360 hiddriver360 Analog Sync Trigger Build (v11 Definitive)")
     print("=================================================================")
 
     if not os.path.exists(base_file):
