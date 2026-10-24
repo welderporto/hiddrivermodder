@@ -7,23 +7,23 @@ Root-cause fixes implemented:
 1. R1 (DllMain Clean Return):
    - At offset 0x0c800, patch with 'b 0xc864' (0x48000064).
    - Cleanly skips UsbdPowerDownNotification, MmFreePhysicalMemory, and UsbdDriverEntry.
-   - Eliminates kernel DMA memory corruption while USB host is active.
    - Preserves power to internal Slim/E Wi-Fi module on Southbridge USB bus.
-   - Guarantees immediate return TRUE (<1ms) to DashLaunch.
+   - Guarantees immediate return TRUE (<1ms) to DashLaunch without freezes.
 
 2. R2 (ShanWan / iPega PG-9076 Hook & Wi-Fi Preservation):
-   - Preserves USB root hub power state (no power-down).
+   - Preserves USB root hub power state.
    - At offset 0x0922c, write 0x480004a8 ('b 0x96d4') and 0x60000000 ('nop' at 0x09230).
    - Skips error 4 (HID_PARSE_UsageListOverflow) in USB_ProcessHIDReport.
 
-3. R3 (Thread Safety, Safe Notification Latch & Controller Detection):
+3. R3 (Thread Safety, Continuous Sync Mode & Controller Detection):
    - Cave at 0x2cab0 (VA 0x81F33AB0) spawns via XapiThreadStartup thunk (0x0a628).
-   - Latch 'has_run' located in Section 4 (.data RW segment) at VA 0x81F43BF0 (file offset 0x34BF0).
-   - Zero-overhead atomicity preventing DSI Data Storage Interrupt page faults.
-   - 5-second polling loop (50 iterations x 100ms) inspecting connectedControllers[0..3].controllerDriver.
-   - Startup banner: "Iniciando o hiddriver, aguarde..." (0x2cc00).
-   - Found banner: "Controle identificado!" (0x2cc60).
-   - Timeout banner: "Nenhum controle identificado!" (0x2cca0).
+   - Latch 'has_run' located in Section 4 (.data RW segment) at VA 0x81F43BF0.
+   - Active Synchronization Mode:
+     - Startup banner: "Sincronizando controle, aguarde..." (0x2cc00).
+     - 5s Fast poll (50 x 100ms).
+     - If not detected yet, shows: "Modo sincronizacao ativo..." (0x2cc80).
+     - Keeps continuous background poll active (120 x 500ms = 60s) so turning on/plugging in controller is caught immediately!
+     - On detection: "Controle sincronizado com sucesso!" (0x2cd00) followed by "Mapear? Segure p/ DIREITA 3s" (0x2cd80).
 
 4. R4 (PT-BR Wizard, 300ms Debounce & Usb:\\hiddriver.json):
    - Complete Portuguese translation of all in-game mapping prompts.
@@ -56,9 +56,11 @@ OFF_WIZARD_HOOK_3    = 0x0ad54
 OFF_DEBOUNCE_CAVE    = 0x2ca40
 OFF_STARTUP_CAVE     = 0x2cab0
 OFF_HAS_RUN_DATA     = 0x34bf0  # VA 0x81F43BF0 in .data (RW)
-OFF_STR_INIT         = 0x2cc00
-OFF_STR_FOUND        = 0x2cc60
-OFF_STR_NOTFOUND     = 0x2cca0
+
+OFF_STR_INIT         = 0x2cc00  # "Sincronizando controle, aguarde..."
+OFF_STR_SYNC_ACTIVE  = 0x2cc80  # "Modo sincronizacao ativo..."
+OFF_STR_FOUND        = 0x2cd00  # "Controle sincronizado com sucesso!"
+OFF_STR_ASK_MAP      = 0x2cd80  # "Mapear? Segure p/ DIREITA 3s"
 
 OFF_SLEEP_THUNK      = 0x2c6cc
 OFF_XNOTIFY_THUNK    = 0x2c6bc
@@ -80,23 +82,14 @@ def assemble_cond_branch(from_off, to_off, bo, bi):
     val = 0x40000000 | (bo << 21) | (bi << 16) | (delta & 0xFFFC)
     return val
 
-def make_bl(from_off, to_off):
-    return assemble_branch(from_off, to_off, lk=True)
-
-def make_b(from_off, to_off):
-    return assemble_branch(from_off, to_off, lk=False)
-
-def make_beq(from_off, to_off):
-    return assemble_cond_branch(from_off, to_off, bo=12, bi=2)
-
-def make_bne(from_off, to_off):
-    return assemble_cond_branch(from_off, to_off, bo=4, bi=2)
-
-def make_bgt(from_off, to_off):
-    return assemble_cond_branch(from_off, to_off, bo=12, bi=1)
+def make_bl(from_off, to_off): return assemble_branch(from_off, to_off, lk=True)
+def make_b(from_off, to_off): return assemble_branch(from_off, to_off, lk=False)
+def make_beq(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=12, bi=2)
+def make_bne(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=4, bi=2)
+def make_bgt(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=12, bi=1)
 
 def build_startup_cave():
-    """Generates the position-independent PowerPC machine code for the startup thread."""
+    """Generates the position-independent PowerPC machine code for the active sync startup thread."""
     cave_ins = [
         # Check has_run latch at VA 0x81F43BF0 (.data segment)
         ('start', lambda off: 0x3d6081f4),                     # lis r11, 0x81f4
@@ -104,32 +97,32 @@ def build_startup_cave():
         ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
         ('', lambda off: make_bne(off, labels['exit_cave'])),  # already ran -> exit
         ('', lambda off: 0x39400001),                          # li r10, 1
-        ('', lambda off: 0x914b3bf0),                          # stw r10, 0x3bf0(r11) (set latch)
+        ('', lambda off: 0x914b3bf0),                          # stw r10, 0x3bf0(r11)
 
-        # Initial Sleep(1500)
-        ('', lambda off: 0x386005dc),                          # li r3, 1500
-        ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
-
-        # Show "Iniciando o hiddriver, aguarde..." banner
-        ('', lambda off: 0x38600022),                          # li r3, 34 (XNOTIFYUI_TYPE_PREFERRED)
-        ('', lambda off: 0x38800000),                          # li r4, 0
-        ('', lambda off: 0x38a00000),                          # li r5, 0
-        ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63c00),                          # addi r6, r6, 0x3c00 (VA 0x81f33c00 = OFF 0x2cc00)
-        ('', lambda off: 0x38e00000),                          # li r7, 0
-        ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
-
-        # Sleep(1000)
+        # Initial Sleep(1000)
         ('', lambda off: 0x386003e8),                          # li r3, 1000
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # 5-second polling loop: 50 iterations x 100ms
-        ('', lambda off: 0x3a800032),                          # li r20, 50
+        # Show 'Sincronizando controle, aguarde...'
+        ('', lambda off: 0x38600022),                          # li r3, 34
+        ('', lambda off: 0x38800000),                          # li r4, 0
+        ('', lambda off: 0x38a00000),                          # li r5, 0
+        ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
+        ('', lambda off: 0x38c63c00),                          # addi r6, r6, 0x3c00 (0x2cc00)
+        ('', lambda off: 0x38e00000),                          # li r7, 0
+        ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        ('detect_loop', lambda off: 0x38600064),               # li r3, 100
+        # Sleep(500)
+        ('', lambda off: 0x386001f4),                          # li r3, 500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # Check connectedControllers[0..3].controllerDriver
+        # Fast polling loop (50 x 100ms = 5s)
+        ('', lambda off: 0x3a800032),                          # li r20, 50
+
+        ('detect_loop_fast', lambda off: 0x38600064),          # li r3, 100
+        ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
+
+        # Check connectedControllers[0..3]
         ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
         ('', lambda off: 0x814b17c4),                          # lwz r10, 0x17c4(r11) (slot 0)
         ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
@@ -144,33 +137,67 @@ def build_startup_cave():
         ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
         ('', lambda off: make_bne(off, labels['found_controller'])),
 
-        # Decrement counter using opcode 13 addic. to update CR0
         ('', lambda off: 0x3694ffff),                          # addic. r20, r20, -1
-        ('', lambda off: make_bgt(off, labels['detect_loop'])),
+        ('', lambda off: make_bgt(off, labels['detect_loop_fast'])),
 
-        # Timeout Branch: "Nenhum controle identificado!"
-        ('not_found', lambda off: 0x38600022),                 # li r3, 34
+        # Show 'Modo sincronizacao ativo...'
+        ('sync_active_banner', lambda off: 0x38600022),        # li r3, 34
         ('', lambda off: 0x38800000),                          # li r4, 0
         ('', lambda off: 0x38a00000),                          # li r5, 0
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63ca0),                          # addi r6, r6, 0x3ca0 (VA 0x81f33ca0 = OFF 0x2cca0)
+        ('', lambda off: 0x38c63c80),                          # addi r6, r6, 0x3c80 (0x2cc80)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
+
+        # Continuous background polling loop (120 x 500ms = 60s)
+        ('', lambda off: 0x3a800078),                          # li r20, 120
+
+        ('detect_loop_bg', lambda off: 0x386001f4),            # li r3, 500
+        ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
+
+        ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
+        ('', lambda off: 0x814b17c4),                          # lwz r10, 0x17c4(r11)
+        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
+        ('', lambda off: make_bne(off, labels['found_controller'])),
+        ('', lambda off: 0x814b1828),                          # lwz r10, 0x1828(r11)
+        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
+        ('', lambda off: make_bne(off, labels['found_controller'])),
+        ('', lambda off: 0x814b188c),                          # lwz r10, 0x188c(r11)
+        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
+        ('', lambda off: make_bne(off, labels['found_controller'])),
+        ('', lambda off: 0x814b18f0),                          # lwz r10, 0x18f0(r11)
+        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
+        ('', lambda off: make_bne(off, labels['found_controller'])),
+
+        ('', lambda off: 0x3694ffff),                          # addic. r20, r20, -1
+        ('', lambda off: make_bgt(off, labels['detect_loop_bg'])),
         ('', lambda off: make_b(off, labels['exit_cave'])),
 
-        # Controller Found Branch: "Controle identificado!"
+        # Found Controller Branch
         ('found_controller', lambda off: 0x38600022),          # li r3, 34
         ('', lambda off: 0x38800000),                          # li r4, 0
         ('', lambda off: 0x38a00000),                          # li r5, 0
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
-        ('', lambda off: 0x38c63c60),                          # addi r6, r6, 0x3c60 (VA 0x81f33c60 = OFF 0x2cc60)
+        ('', lambda off: 0x38c63d00),                          # addi r6, r6, 0x3d00 (0x2cd00)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
-        ('', lambda off: 0x38600bb8),                          # li r3, 3000
+
+        ('', lambda off: 0x386007d0),                          # li r3, 2000
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # Exit & Original Thunk Return
-        ('exit_cave', lambda off: 0x81810058),                 # lwz r12, 0x58(r1) (restore r12)
+        # Show 'Mapear? Segure p/ DIREITA 3s'
+        ('', lambda off: 0x38600022),                          # li r3, 34
+        ('', lambda off: 0x38800000),                          # li r4, 0
+        ('', lambda off: 0x38a00000),                          # li r5, 0
+        ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
+        ('', lambda off: 0x38c63d80),                          # addi r6, r6, 0x3d80 (0x2cd80)
+        ('', lambda off: 0x38e00000),                          # li r7, 0
+        ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
+
+        ('', lambda off: 0x386007d0),                          # li r3, 2000
+        ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
+
+        ('exit_cave', lambda off: 0x81810058),                 # lwz r12, 0x58(r1)
         ('', lambda off: 0x4e800020),                          # blr
     ]
 
@@ -237,33 +264,32 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     data[OFF_DEBOUNCE_CAVE:OFF_DEBOUNCE_CAVE+len(debounce_cave)] = debounce_cave
 
     # 4. R3: Threading Hook, Code Cave & has_run Latch in .data
-    print("[-] Applying R3: Thread Hook (0x0a628), Startup Cave (0x2cab0) & .data Latch...")
+    print("[-] Applying R3: Active Synchronization Mode Cave (0x2cab0) & .data Latch...")
     data[OFF_THREAD_HOOK:OFF_THREAD_HOOK+4] = (0x48022489).to_bytes(4, 'big') # bl 0x2cab0
 
     startup_cave = build_startup_cave()
     data[OFF_STARTUP_CAVE:OFF_STARTUP_CAVE+len(startup_cave)] = startup_cave
 
     # UTF-16BE Notification Strings
-    s_init = "Iniciando o hiddriver, aguarde...".encode("utf-16-be") + b"\x00\x00"
-    s_found = "Controle identificado!".encode("utf-16-be") + b"\x00\x00"
-    s_notfound = "Nenhum controle identificado!".encode("utf-16-be") + b"\x00\x00"
+    s_init        = "Sincronizando controle, aguarde...".encode("utf-16-be") + b"\x00\x00"
+    s_sync_active = "Modo sincronizacao ativo...".encode("utf-16-be") + b"\x00\x00"
+    s_found       = "Controle sincronizado com sucesso!".encode("utf-16-be") + b"\x00\x00"
+    s_ask_map     = "Mapear? Segure p/ DIREITA 3s".encode("utf-16-be") + b"\x00\x00"
 
     data[OFF_STR_INIT:OFF_STR_INIT+len(s_init)] = s_init
+    data[OFF_STR_SYNC_ACTIVE:OFF_STR_SYNC_ACTIVE+len(s_sync_active)] = s_sync_active
     data[OFF_STR_FOUND:OFF_STR_FOUND+len(s_found)] = s_found
-    data[OFF_STR_NOTFOUND:OFF_STR_NOTFOUND+len(s_notfound)] = s_notfound
+    data[OFF_STR_ASK_MAP:OFF_STR_ASK_MAP+len(s_ask_map)] = s_ask_map
 
     # Clear has_run latch at VA 0x81F43BF0 (file offset 0x34BF0 in .data)
     data[OFF_HAS_RUN_DATA:OFF_HAS_RUN_DATA+4] = bytes(4)
 
     # 5. R5: Native iPega PG-9076 / ShanWan (VID 0x2563, PID 0x0575) Static Mapping
     print("[-] Applying R5: Native iPega PG-9076 (VID 0x2563, PID 0x0575) Static Mapping...")
-    # Copy original 7 static device mappings (168 bytes) to expanded table at 0x34c00
     orig_mappings = bytes(data[OFF_ORIG_STATIC_MAPPINGS:OFF_ORIG_STATIC_MAPPINGS+168])
     data[OFF_EXPANDED_MAPPINGS:OFF_EXPANDED_MAPPINGS+168] = orig_mappings
 
     # Build 8th entry: iPega PG-9076 (24 bytes)
-    # VID=0x2563, PID=0x0575, axisMap=0x81F02B70, axisMapCount=6, buttonMap=0x81F43CC0, buttonMapCount=13
-    # invert=[1, 0, 0, 0, 1, 0] (invertY and invertRZ)
     ipega_entry = struct.pack(
         ">HHIIIH6B",
         0x2563, 0x0575,           # vid, pid
@@ -276,10 +302,6 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     data[OFF_EXPANDED_MAPPINGS+168:OFF_EXPANDED_MAPPINGS+192] = ipega_entry
 
     # Build 13-button mapping table at 0x34cc0 (VA 0x81F43CC0)
-    # ButtonsReport offsets:
-    # 0x0F: A, 0x0E: B, 0x10: X, 0x0D: Y
-    # 0x1D: LB, 0x1C: RB, 0x1B: LT, 0x1A: RT
-    # 0x19: Back, 0x18: Start, 0x17: L3, 0x16: R3, 0x1E: Xbox Guide
     ipega_buttons = [
         (1, 0x0F),   # Cross / A
         (2, 0x0E),   # Circle / B
@@ -299,8 +321,6 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     data[OFF_IPEGA_BUTTONS:OFF_IPEGA_BUTTONS+len(ipega_btn_bytes)] = ipega_btn_bytes
 
     # Patch inlined FindStaticMapping in HidAddDeviceHook:
-    # 0x0bbb0: addi r11, r11, 0x3c00 (0x396b3c00) -> points r11 to 0x81F43C00
-    # 0x0bbd4: cmplwi cr6, r10, 0xc0 (0x2b0a00c0) -> 8 entries * 24 = 192 bytes = 0xc0
     data[OFF_FIND_MAPPING_BASE:OFF_FIND_MAPPING_BASE+4] = (0x396b3c00).to_bytes(4, "big")
     data[OFF_FIND_MAPPING_BOUND:OFF_FIND_MAPPING_BOUND+4] = (0x2b0a00c0).to_bytes(4, "big")
 
@@ -341,8 +361,11 @@ def verify_patched_binary(data: bytearray) -> bool:
     path = data[0x413c:0x414f]
     assert path == b"Usb:\\hiddriver.json", f"R4 Failed: Path must be Usb:\\hiddriver.json, got {path}"
 
-    s_init_read = data[0x2cc00:0x2cc44].decode("utf-16-be").rstrip("\x00")
-    assert s_init_read == "Iniciando o hiddriver, aguarde...", f"Banner init mismatch: {s_init_read}"
+    s_init_read = data[0x2cc00:0x2cc46].decode("utf-16-be").rstrip("\x00")
+    assert s_init_read == "Sincronizando controle, aguarde...", f"Banner init mismatch: {s_init_read}"
+
+    s_sync_read = data[0x2cc80:0x2ccb8].decode("utf-16-be").rstrip("\x00")
+    assert s_sync_read == "Modo sincronizacao ativo...", f"Banner sync active mismatch: {s_sync_read}"
 
     # R5 Native Mapping Verification
     map_base = struct.unpack(">I", data[0x0bbb0:0x0bbb4])[0]
@@ -417,7 +440,7 @@ def main():
     output_packaged = os.path.join(workspace, "hiddriver.xex")
 
     print("=================================================================")
-    print("  Xbox 360 hiddriver360 Definitive Technical Overhaul & Build   ")
+    print("  Xbox 360 hiddriver360 Active Sync Mode Build                   ")
     print("=================================================================")
 
     if not os.path.exists(base_file):
@@ -448,7 +471,7 @@ def main():
     deploy_to_console(output_packaged, "E:\\")
 
     print("\n=================================================================")
-    print("  Build & Deployment SUCCEEDED: All Requirements Satisfied!     ")
+    print("  Build & Deployment SUCCEEDED: Active Sync Mode Ready!          ")
     print("=================================================================")
 
 if __name__ == "__main__":
