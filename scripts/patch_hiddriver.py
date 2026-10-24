@@ -4,14 +4,13 @@ patch_hiddriver.py - Script de modificacao para hiddriver360 (v0.6 beta)
 Autor original: EinTim23 (https://github.com/EinTim23/hiddriver360)
 Modificacoes: Welder Porto (https://github.com/welderporto/hiddrivermodder)
 
-Versao 5.0 - Modificacoes aplicadas:
-1. Re-enumeracao USB Segura via UsbdTitleDriverResetAllUnrecognizedPorts (Ordinal 890):
-   - No codigo original, o driver executava UsbdPowerDownNotification() para forcar re-enumeracao,
-     o que cortava a energia do hub USB interno e desativava a placa Wi-Fi no Xbox 360 Slim/E.
-   - Na v5.0, em DllMain (offset 0xc800) importamos e invocamos a API nativa da Microsoft:
-     UsbdTitleDriverResetAllUnrecognizedPorts() (Ordinal 890 em xboxkrnl.exe).
-   - Esta API envia sinal de reset USB APENAS para portas com dispositivos desconhecidos (ex: dongle do iPega),
-     preservando a placa Wi-Fi interna 100% ativa e conectada a rede!
+Versao 6.0 (Safe Stable) - Modificacoes aplicadas:
+1. Prevencao de Queda do Wi-Fi sem quebrar a re-enumeracao USB:
+   - No codigo original, o driver executava UsbdPowerDownNotification() para desligar os hubs USB,
+     cortando a alimentacao do chip Wi-Fi interno do Xbox 360 Slim/E e derrubando a rede sem fio.
+   - Patch: NOP na chamada de UsbdPowerDownNotification() (offset 0xc80c..0xc818).
+   - O driver mantem a re-enumeracao nativa (UsbdDriverEntry), permitindo que controles ja plugados
+     sejam detectados no boot SEM desligar a alimentacao da placa Wi-Fi!
 
 2. Notificacao de Inicializacao e Deteccao Responsiva de 5 Segundos:
    - Exibe no boot: "Iniciando o hiddriver, aguarde...".
@@ -19,11 +18,10 @@ Versao 5.0 - Modificacoes aplicadas:
    - Assim que o controle e detectado: exibe "Controle identificado!" e prossegue.
    - Se esgotar 5s sem nenhum controle: exibe "Nenhum controle identificado!".
    - Trava de execucao unica (has_run flag) para nao re-executar em loop e manter a thread
-     MappingManagerThreadProc livre para monitoramento em segundo plano.
+     MappingManagerThreadProc 100% livre para mapeamento e jogo.
 
 3. Correcao de estouro da pilha de Usages (Usage List Overflow):
    - Controles ShanWan / iPega PG-9076 (VID:PID 2563:0575) reportam 12 usages consecutivos.
-   - O parser original tinha limite de 8, retornando erro 4 (HID_PARSE_UsageListOverflow).
    - Patch: 'b 0x81f106d4' no offset 0x922c para ignorar usages excedentes com seguranca.
 
 4. Redirecionamento do arquivo de configuracao:
@@ -66,54 +64,36 @@ def patch_binary(data: bytearray) -> bytearray:
         disp = (to_off - from_off) & 0xFFFC
         return 0x41810000 | disp
 
-    # 1. Resolve Ordinal 890 (UsbdTitleDriverResetAllUnrecognizedPorts) in initFunctionPointers
-    # offset 0xc3b8: li r4, 890 (0x3880037a)
-    data[0xc3b8:0xc3bc] = (0x3880037a).to_bytes(4, 'big')
+    # 1. NOP out UsbdPowerDownNotification() in DllMain (offset 0xc80c..0xc818)
+    for off in range(0xc80c, 0xc81c, 4):
+        data[off:off+4] = (0x60000000).to_bytes(4, 'big')
 
-    # 2. Patch DllMain at 0xc800: Safe USB reset (Ordinal 890) instead of destructive power-down
-    # lis r10, 0x81f4; lwz r9, 0x1b10(r10); cmplwi r9, 0; beq +16; mtctr r9; bctrl; b 0xc864; b 0xc864
-    c800_code = [
-        0x3d4081f4,
-        0x812a1b10,
-        0x28090000,
-        0x41820010,
-        0x7d2903a6,
-        0x4e800421,
-        0x4800004c,
-        0x48000048
-    ]
-    for idx, ins in enumerate(c800_code):
-        data[0xc800 + idx*4 : 0xc800 + (idx+1)*4] = ins.to_bytes(4, 'big')
-
-    # 3. Patch Usage List Overflow (ShanWan / iPega PG-9076)
-    # b 0x81f106d4 em 0x81f1022c (offset 0x922c no uncompressed)
+    # 2. Patch Usage List Overflow (ShanWan / iPega PG-9076)
     off_overflow = 0x922c
     data[off_overflow:off_overflow+4] = (0x480004a8).to_bytes(4, 'big')
 
-    # 4. Config path: HDD:\hiddriver.json -> Usb:\hiddriver.json
+    # 3. Config path: HDD:\hiddriver.json -> Usb:\hiddriver.json
     path_old = b'HDD:\\hiddriver.json'
     path_new = b'Usb:\\hiddriver.json'
     idx = data.find(path_old)
     if idx != -1:
         data[idx:idx+len(path_new)] = path_new
 
-    # 5. Code cave timing (300 ms debounce)
+    # 4. Code cave timing (300 ms debounce)
     data[0x2ca50:0x2ca54] = (0x3860012c).to_bytes(4, 'big')
 
-    # 6. Call site at 0xa628 in MappingManagerThreadProc: bl 0x2cab0 (0x48022489)
+    # 5. Call site at 0xa628 in MappingManagerThreadProc: bl 0x2cab0 (0x48022489)
     data[0xa628:0xa62c] = (0x48022489).to_bytes(4, 'big')
 
-    # 7. Assemble v5.0 Code Cave at 0x2cab0
+    # 6. Assemble Code Cave at 0x2cab0
     insns = []
     # has_run check
     insns.append(('start', lambda off: 0x3d6081f3)) # lis r11, 0x81f3
     insns.append(('', lambda off: 0x814b3bf0))      # lwz r10, 0x3bf0(r11)
     insns.append(('', lambda off: 0x280a0001))      # cmplwi r10, 1
-    insns.append(('', lambda off: make_bne(off, labels['do_startup'])))
-    insns.append(('', lambda off: 0x7f9de378))      # mr r29, r28
-    insns.append(('', lambda off: 0x4e800020))      # blr
+    insns.append(('', lambda off: make_beq(off, labels['already_ran'])))
 
-    # Startup prologue
+    # First run: set has_run = 1
     insns.append(('do_startup', lambda off: 0x39400001)) # li r10, 1
     insns.append(('', lambda off: 0x914b3bf0))           # stw r10, 0x3bf0(r11)
     insns.append(('', lambda off: 0x7d8802a6))           # mflr r12
@@ -125,15 +105,6 @@ def patch_binary(data: bytearray) -> bytearray:
     # Sleep 500ms
     insns.append(('', lambda off: 0x386001f4))           # li r3, 500
     insns.append(('', lambda off: make_bl(off, SLEEP_OFF)))
-
-    # Call UsbdTitleDriverResetAllUnrecognizedPorts()
-    insns.append(('', lambda off: 0x3d6081f4))           # lis r11, 0x81f4
-    insns.append(('', lambda off: 0x818b1b10))           # lwz r12, 0x1b10(r11)
-    insns.append(('', lambda off: 0x280c0000))           # cmplwi r12, 0
-    insns.append(('', lambda off: make_beq(off, labels['skip_reset'])))
-    insns.append(('', lambda off: 0x7d8903a6))           # mtctr r12
-    insns.append(('', lambda off: 0x4e800421))           # bctrl
-    insns.append(('skip_reset', lambda off: 0x60000000)) # nop
 
     # Notification 1: 'Iniciando o hiddriver, aguarde...'
     insns.append(('', lambda off: 0x38600050))           # li r3, 80
@@ -196,8 +167,10 @@ def patch_binary(data: bytearray) -> bytearray:
     insns.append(('', lambda off: 0x81810058))           # lwz r12, 0x58(r1)
     insns.append(('', lambda off: 0x7d8803a6))           # mtlr r12
     insns.append(('', lambda off: 0x38210050))           # addi r1, r1, 0x50
-    insns.append(('', lambda off: 0x7f9de378))           # mr r29, r28
-    insns.append(('', lambda off: 0x4e800020))           # blr
+
+    # Already ran
+    insns.append(('already_ran', lambda off: 0x7f9de378)) # mr r29, r28
+    insns.append(('', lambda off: 0x4e800020))            # blr
 
     # Resolve labels
     START_OFF = 0x2cab0
@@ -241,4 +214,4 @@ if __name__ == '__main__':
     with open(sys.argv[2], 'wb') as f:
         f.write(patched)
 
-    print("Arquivo modificado com sucesso (v5.0: Reset Ordinal 890 + Janela 5s + Notificacoes + ShanWan + PT-BR + Timing)!")
+    print("Arquivo modificado com sucesso (v6.0 Safe Stable)!")
