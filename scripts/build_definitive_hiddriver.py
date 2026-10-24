@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""
-build_definitive_hiddriver.py - Comprehensive Technical Overhaul & Build Automation (v8 Final)
+r"""
+build_definitive_hiddriver.py - Comprehensive Technical Overhaul & Build Automation (v9 Definitive)
 Target: Xbox 360 Homebrew USB Controller Driver hiddriver360 (v0.6 beta)
 
 Root-cause fixes implemented:
-1. R1 (DllMain Clean Return):
+1. R1 (DllMain Clean Return & Targeted Unrecognized USB Port Reset):
    - At offset 0x0c800, patch with 'b 0xc864' (0x48000064).
    - Cleanly skips UsbdPowerDownNotification, MmFreePhysicalMemory, and synchronous UsbdDriverEntry.
-   - Prevents USB drive I/O collisions while DashLaunch is reading plugins.
-   - Guarantees immediate return TRUE (<1ms) to DashLaunch without freezes.
+   - Prevents USB drive I/O collisions while DashLaunch is reading plugins and preserves Slim/E internal Wi-Fi.
+   - At offset 0x0c3b8 in initFunctionPointers, resolves xboxkrnl.exe Ordinal 890 (0x037A:
+     UsbdTitleDriverResetAllUnrecognizedPorts) into 0x81F41B10 instead of unused MmFreePhysicalMemory (189).
 
 2. R2 (ShanWan / iPega PG-9076 Hook & Wi-Fi Preservation):
    - Preserves USB root hub power state.
    - At offset 0x0922c, write 0x480004a8 ('b 0x96d4') and 0x60000000 ('nop' at 0x09230).
    - Skips error 4 (HID_PARSE_UsageListOverflow) in USB_ProcessHIDReport.
 
-3. R3 (Thread Safety, Safe Delayed USB Re-enumeration & Auto-Recognition):
-   - Cave at 0x2cab0 (VA 0x81F33AB0) spawns via XapiThreadStartup thunk (0x0a628).
-   - Stack frame & LR correctly preserved (mflr r0 / stwu r1, -64(r1) ... addi r1, r1, 64 / mtlr r0 / blr).
-   - Restores original instruction mr r29, r27.
-   - 2500ms post-boot delay ensures DashLaunch is completely finished and Aurora is running in RAM.
-   - Calls UsbdDriverEntry(0, 0) WITHOUT UsbdPowerDownNotification and WITHOUT MmFreePhysicalMemory.
-     - Preserves physical DMA memory and power to internal Slim/E Wi-Fi module!
-     - Forces host controller to re-scan ports and recognize the connected iPega dongle automatically!
-   - Active Notification System:
+3. R3 (Thread Safety, Targeted Unrecognized Port Re-enumeration, Auto-Recognition & BACK+START 2s Remap):
+   - Startup cave at 0x2cab0 (VA 0x81F33AB0) hooked at 0x0a628 in MappingManagerThreadProc.
+   - Verified PowerPC ABI prologue/epilogue (mflr r12; stwu r1, -0x50(r1); stw r12, 0x58(r1) ...
+     lwz r12, 0x58(r1); mtlr r12; addi r1, r1, 0x50; mr r29, r28; blr).
+   - Invokes UsbdTitleDriverResetAllUnrecognizedPorts (Ordinal 890) to reset ONLY unrecognized USB ports
+     (such as the iPega PG-9076 2.4G dongle plugged in at boot) without disturbing Wi-Fi or Usb:\ storage.
+   - Active Notification System (using XNOTIFYUI_CUSTOM = 0x50, XUSER_INDEX_ANY = 0xFF, priority = 1):
      - 0x2cd00: "Sincronizando controle, aguarde..."
      - 0x2cd80: "Modo sincronizacao ativo..."
      - 0x2ce00: "Controle sincronizado com sucesso!"
      - 0x2ce80: "Configurar? BACK+START 2s (ou ignore)"
+   - Combo cave at 0x2cc50 (VA 0x81F33C50) hooked at 0x0a648 in MappingManagerThreadProc:
+     - Checks if BACK + START (-0x20(r31) == 0x0101) are held simultaneously for 20 ticks (2.0 seconds).
+     - Clears connectedControllers[i].map (0(r31) = 0) to launch the PT-BR mapping wizard on demand.
 
 4. R4 (PT-BR Wizard, 300ms Debounce & Usb:\\hiddriver.json):
    - Complete Portuguese translation of all in-game mapping prompts.
@@ -51,15 +53,19 @@ import shutil
 OFF_PTBR_BLOCK_START = 0x03f78
 OFF_PTBR_BLOCK_END   = 0x04198
 OFF_USAGE_OVERFLOW   = 0x0922c
+OFF_ORDINAL_PATCH    = 0x0c3b8  # li r4, 890 (0x3880037a) -> UsbdTitleDriverResetAllUnrecognizedPorts
 OFF_DLLMAIN_RESET    = 0x0c800
 OFF_THREAD_HOOK      = 0x0a628
+OFF_COMBO_HOOK       = 0x0a648  # bl 0x2cc50 (BACK+START 2s remap trigger)
 OFF_WIZARD_HOOK_1    = 0x0a75c
 OFF_WIZARD_HOOK_2    = 0x0ab6c
 OFF_WIZARD_HOOK_3    = 0x0ad54
 
 OFF_DEBOUNCE_CAVE    = 0x2ca40
 OFF_STARTUP_CAVE     = 0x2cab0
+OFF_COMBO_CAVE       = 0x2cc50
 OFF_HAS_RUN_DATA     = 0x34bf0  # VA 0x81F43BF0 in .data (RW)
+OFF_COMBO_CNT_DATA   = 0x34bf4  # VA 0x81F43BF4 in .data (RW)
 
 OFF_STR_INIT         = 0x2cd00  # "Sincronizando controle, aguarde..."
 OFF_STR_SYNC_ACTIVE  = 0x2cd80  # "Modo sincronizacao ativo..."
@@ -93,53 +99,48 @@ def make_bne(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo
 def make_bgt(from_off, to_off): return assemble_cond_branch(from_off, to_off, bo=12, bi=1)
 
 def build_startup_cave():
-    """Generates the position-independent PowerPC machine code for the active sync startup thread."""
+    """Generates verified PowerPC machine code for the startup auto-recognition & sync cave."""
     cave_ins = [
-        # Prologue: save caller's LR and allocate 64-byte stack frame
-        ('start', lambda off: 0x7d8802a6),                     # mflr r0
-        ('', lambda off: 0x9001fff8),                          # stw r0, -8(r1)
-        ('', lambda off: 0x9421ffc0),                          # stwu r1, -64(r1)
-
-        # Restores original instruction at 0x0a628: mr r29, r27
-        ('', lambda off: 0x7f9de378),                          # mr r29, r27
-
-        # Check has_run latch at VA 0x81F43BF0 (.data segment)
-        ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
+        # 1. Check has_run latch at VA 0x81F43BF0 (.data segment) before touching stack
+        ('start', lambda off: 0x3d6081f4),                     # lis r11, 0x81f4
         ('', lambda off: 0x814b3bf0),                          # lwz r10, 0x3bf0(r11)
-        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
-        ('', lambda off: make_bne(off, labels['exit_cave'])),  # already ran -> exit
+        ('', lambda off: 0x280a0001),                          # cmplwi r10, 1
+        ('', lambda off: make_beq(off, labels['already_ran'])),# if already ran -> restore r29 and return
         ('', lambda off: 0x39400001),                          # li r10, 1
         ('', lambda off: 0x914b3bf0),                          # stw r10, 0x3bf0(r11)
 
-        # Sleep(2500) - Allow DashLaunch to finish loading plugins and Aurora to run in RAM
-        ('', lambda off: 0x386009c4),                          # li r3, 2500
+        # 2. Verified PowerPC ABI Prologue: save LR (via r12) and non-volatile r20, r21
+        ('', lambda off: 0x7d8802a6),                          # mflr r12
+        ('', lambda off: 0x9421ffb0),                          # stwu r1, -0x50(r1)
+        ('', lambda off: 0x91810058),                          # stw r12, 0x58(r1)
+        ('', lambda off: 0x92810014),                          # stw r20, 0x14(r1)
+        ('', lambda off: 0x92a10018),                          # stw r21, 0x18(r1)
+
+        # 3. Sleep(1500) - Allow DashLaunch/Aurora initialization to settle
+        ('', lambda off: 0x386005dc),                          # li r3, 1500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
-        # Show 'Sincronizando controle, aguarde...'
-        ('', lambda off: 0x38600022),                          # li r3, 34
-        ('', lambda off: 0x38800000),                          # li r4, 0
-        ('', lambda off: 0x38a00000),                          # li r5, 0
+        # 4. Show 'Sincronizando controle, aguarde...' (XNOTIFYUI_CUSTOM = 0x50)
+        ('', lambda off: 0x38600050),                          # li r3, 0x50
+        ('', lambda off: 0x388000ff),                          # li r4, 0xff
+        ('', lambda off: 0x38a00001),                          # li r5, 1
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
         ('', lambda off: 0x38c63d00),                          # addi r6, r6, 0x3d00 (0x2cd00)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        # Call UsbdDriverEntry(0, 0) to re-enumerate USB ports cleanly without powerdown!
+        # 5. Call UsbdTitleDriverResetAllUnrecognizedPorts() (Ordinal 890 at 0x81F41B10)
         ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
-        ('', lambda off: 0x814b1b0c),                          # lwz r10, 0x1b0c(r11) (UsbdDriverEntry ptr)
+        ('', lambda off: 0x814b1b10),                          # lwz r10, 0x1b10(r11)
         ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
-        ('', lambda off: make_beq(off, labels['skip_usbd'])),  # safety check: if null skip
+        ('', lambda off: make_beq(off, labels['skip_reset1'])),# if null -> skip safely
         ('', lambda off: 0x7d4903a6),                          # mtctr r10
         ('', lambda off: 0x38600000),                          # li r3, 0
         ('', lambda off: 0x38800000),                          # li r4, 0
-        ('', lambda off: 0x4e800421),                          # bctrl (call UsbdDriverEntry!)
+        ('', lambda off: 0x4e800421),                          # bctrl
 
-        # Sleep(800) - Allow the kernel to complete USB bus reset & device configuration
-        ('skip_usbd', lambda off: 0x38600320),                 # li r3, 800
-        ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
-
-        # Fast polling loop (30 x 100ms = 3s)
-        ('', lambda off: 0x3a80001e),                          # li r20, 30
+        # 6. Fast polling loop (50 x 100ms = 5s)
+        ('skip_reset1', lambda off: 0x3a800032),               # li r20, 50
 
         ('detect_loop_fast', lambda off: 0x38600064),          # li r3, 100
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
@@ -162,17 +163,26 @@ def build_startup_cave():
         ('', lambda off: 0x3694ffff),                          # addic. r20, r20, -1
         ('', lambda off: make_bgt(off, labels['detect_loop_fast'])),
 
-        # Show 'Modo sincronizacao ativo...'
-        ('sync_active_banner', lambda off: 0x38600022),        # li r3, 34
+        # 7. Second targeted reset + Show 'Modo sincronizacao ativo...'
+        ('', lambda off: 0x3d6081f4),                          # lis r11, 0x81f4
+        ('', lambda off: 0x814b1b10),                          # lwz r10, 0x1b10(r11)
+        ('', lambda off: 0x280a0000),                          # cmplwi r10, 0
+        ('', lambda off: make_beq(off, labels['skip_reset2'])),
+        ('', lambda off: 0x7d4903a6),                          # mtctr r10
+        ('', lambda off: 0x38600000),                          # li r3, 0
         ('', lambda off: 0x38800000),                          # li r4, 0
-        ('', lambda off: 0x38a00000),                          # li r5, 0
+        ('', lambda off: 0x4e800421),                          # bctrl
+
+        ('skip_reset2', lambda off: 0x38600050),               # li r3, 0x50
+        ('', lambda off: 0x388000ff),                          # li r4, 0xff
+        ('', lambda off: 0x38a00001),                          # li r5, 1
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
         ('', lambda off: 0x38c63d80),                          # addi r6, r6, 0x3d80 (0x2cd80)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        # Continuous background polling loop (60 x 500ms = 30s)
-        ('', lambda off: 0x3a80003c),                          # li r20, 60
+        # 8. Continuous background polling loop (50 x 500ms = 25s)
+        ('', lambda off: 0x3a800032),                          # li r20, 50
 
         ('detect_loop_bg', lambda off: 0x386001f4),            # li r3, 500
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
@@ -193,12 +203,12 @@ def build_startup_cave():
 
         ('', lambda off: 0x3694ffff),                          # addic. r20, r20, -1
         ('', lambda off: make_bgt(off, labels['detect_loop_bg'])),
-        ('', lambda off: make_b(off, labels['exit_cave'])),
+        ('', lambda off: make_b(off, labels['finish'])),
 
-        # Found Controller Branch
-        ('found_controller', lambda off: 0x38600022),          # li r3, 34
-        ('', lambda off: 0x38800000),                          # li r4, 0
-        ('', lambda off: 0x38a00000),                          # li r5, 0
+        # 9. Found Controller Branch
+        ('found_controller', lambda off: 0x38600050),          # li r3, 0x50
+        ('', lambda off: 0x388000ff),                          # li r4, 0xff
+        ('', lambda off: 0x38a00001),                          # li r5, 1
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
         ('', lambda off: 0x38c63e00),                          # addi r6, r6, 0x3e00 (0x2ce00)
         ('', lambda off: 0x38e00000),                          # li r7, 0
@@ -208,19 +218,23 @@ def build_startup_cave():
         ('', lambda off: make_bl(off, OFF_SLEEP_THUNK)),       # bl Sleep
 
         # Show 'Configurar? BACK+START 2s (ou ignore)'
-        ('', lambda off: 0x38600022),                          # li r3, 34
-        ('', lambda off: 0x38800000),                          # li r4, 0
-        ('', lambda off: 0x38a00000),                          # li r5, 0
+        ('', lambda off: 0x38600050),                          # li r3, 0x50
+        ('', lambda off: 0x388000ff),                          # li r4, 0xff
+        ('', lambda off: 0x38a00001),                          # li r5, 1
         ('', lambda off: 0x3cc081f3),                          # lis r6, 0x81f3
         ('', lambda off: 0x38c63e80),                          # addi r6, r6, 0x3e80 (0x2ce80)
         ('', lambda off: 0x38e00000),                          # li r7, 0
         ('', lambda off: make_bl(off, OFF_XNOTIFY_THUNK)),     # bl XNotifyQueueUI
 
-        # Epilogue: Cleanly restore stack frame, LR, and return to caller (0x0a62c)
-        ('exit_cave', lambda off: 0x38210040),                 # addi r1, r1, 64 (deallocate frame)
-        ('', lambda off: 0x8001fff8),                          # lwz r0, -8(r1)  (restore original LR)
-        ('', lambda off: 0x7c0803a6),                          # mtlr r0         (put back in LR)
-        ('', lambda off: 0x4e800020),                          # blr             (clean return to 0x0a62c!)
+        # 10. Verified PowerPC ABI Epilogue
+        ('finish', lambda off: 0x82810014),                    # lwz r20, 0x14(r1)
+        ('', lambda off: 0x82a10018),                          # lwz r21, 0x18(r1)
+        ('', lambda off: 0x81810058),                          # lwz r12, 0x58(r1)
+        ('', lambda off: 0x7d8803a6),                          # mtlr r12
+        ('', lambda off: 0x38210050),                          # addi r1, r1, 0x50
+
+        ('already_ran', lambda off: 0x7f9de378),               # mr r29, r28 (original instruction at 0x0a628)
+        ('', lambda off: 0x4e800020),                          # blr
     ]
 
     labels = {}
@@ -239,13 +253,55 @@ def build_startup_cave():
 
     return bytes(machine_code)
 
+def build_combo_cave():
+    """Generates PowerPC machine code at 0x2cc50 for the BACK+START 2s remap trigger."""
+    cave_ins = [
+        ('start', lambda off: 0x817f0000),                     # lwz r11, 0(r31) (connectedControllers[i].map)
+        ('', lambda off: 0x280b0000),                          # cmplwi r11, 0
+        ('', lambda off: 0x4d820020),                          # beqlr (if map == NULL, return immediately)
+        ('', lambda off: 0xa15fffe0),                          # lhz r10, -0x20(r31) ((start << 8) | back)
+        ('', lambda off: 0x280a0101),                          # cmplwi r10, 0x0101 (both START and BACK pressed?)
+        ('', lambda off: 0x3d2081f4),                          # lis r9, 0x81f4
+        ('', lambda off: make_bne(off, labels['reset_cnt'])),  # if not held -> reset counter
+        ('', lambda off: 0x81093bf4),                          # lwz r8, 0x3bf4(r9) (load hold counter)
+        ('', lambda off: 0x39080001),                          # addi r8, r8, 1
+        ('', lambda off: 0x91093bf4),                          # stw r8, 0x3bf4(r9)
+        ('', lambda off: 0x28080014),                          # cmplwi r8, 20 (20 * 100ms = 2.0s)
+        ('', lambda off: 0x4d800020),                          # bltlr (if < 20 ticks, keep current map)
+        ('', lambda off: 0x39000000),                          # li r8, 0
+        ('', lambda off: 0x91093bf4),                          # stw r8, 0x3bf4(r9) (reset hold counter)
+        ('', lambda off: 0x911f0000),                          # stw r8, 0(r31) (clear map -> triggers wizard!)
+        ('', lambda off: 0x39600000),                          # li r11, 0 (set r11 = 0 for caller cmplwi cr6, r11, 0)
+        ('', lambda off: 0x4e800020),                          # blr
+        ('reset_cnt', lambda off: 0x39000000),                 # li r8, 0
+        ('', lambda off: 0x91093bf4),                          # stw r8, 0x3bf4(r9)
+        ('', lambda off: 0x4e800020),                          # blr
+    ]
+
+    labels = {}
+    cur_off = OFF_COMBO_CAVE
+    for label, _ in cave_ins:
+        if label:
+            labels[label] = cur_off
+        cur_off += 4
+
+    cur_off = OFF_COMBO_CAVE
+    machine_code = bytearray()
+    for _, gen in cave_ins:
+        ins = gen(cur_off)
+        machine_code.extend(ins.to_bytes(4, 'big'))
+        cur_off += 4
+
+    return bytes(machine_code)
+
 def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     """Applies all root-cause technical overhaul patches to the uncompressed XEX."""
     data = bytearray(base_bytes)
 
-    # 1. R1: DllMain Clean Return (0x0c800)
-    print("[-] Applying R1: DllMain Clean Return ('b 0xc864' at 0x0c800)...")
+    # 1. R1: DllMain Clean Return (0x0c800) & Ordinal 890 Resolution (0x0c3b8)
+    print("[-] Applying R1: DllMain Clean Return ('b 0xc864' at 0x0c800) & Ordinal 890 at 0x0c3b8...")
     data[OFF_DLLMAIN_RESET:OFF_DLLMAIN_RESET+4] = (0x48000064).to_bytes(4, 'big')
+    data[OFF_ORDINAL_PATCH:OFF_ORDINAL_PATCH+4] = (0x3880037a).to_bytes(4, 'big')  # li r4, 890
 
     # 2. R2: ShanWan / iPega PG-9076 Usage Overflow Patch (0x0922c)
     print("[-] Applying R2: ShanWan Descriptor Overflow Bypass ('b 0x96d4' at 0x0922c)...")
@@ -285,12 +341,18 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     )
     data[OFF_DEBOUNCE_CAVE:OFF_DEBOUNCE_CAVE+len(debounce_cave)] = debounce_cave
 
-    # 4. R3: Threading Hook, Code Cave & has_run Latch in .data
-    print("[-] Applying R3: Active Auto-Re-enumeration Startup Cave (0x2cab0) & .data Latch...")
-    data[OFF_THREAD_HOOK:OFF_THREAD_HOOK+4] = (0x48022489).to_bytes(4, 'big') # bl 0x2cab0
+    # 4. R3: Threading Hook, Startup Cave, Combo Cave & .data Latches
+    print("[-] Applying R3: Startup Cave (0x2cab0), Combo Cave (0x2cc50) & .data Latches...")
+    data[OFF_THREAD_HOOK:OFF_THREAD_HOOK+4] = make_bl(OFF_THREAD_HOOK, OFF_STARTUP_CAVE).to_bytes(4, 'big')
+    data[OFF_COMBO_HOOK:OFF_COMBO_HOOK+4] = make_bl(OFF_COMBO_HOOK, OFF_COMBO_CAVE).to_bytes(4, 'big')
 
     startup_cave = build_startup_cave()
+    assert OFF_STARTUP_CAVE + len(startup_cave) <= OFF_COMBO_CAVE, "Startup cave overlaps combo cave!"
     data[OFF_STARTUP_CAVE:OFF_STARTUP_CAVE+len(startup_cave)] = startup_cave
+
+    combo_cave = build_combo_cave()
+    assert OFF_COMBO_CAVE + len(combo_cave) <= OFF_STR_INIT, "Combo cave overlaps notification strings!"
+    data[OFF_COMBO_CAVE:OFF_COMBO_CAVE+len(combo_cave)] = combo_cave
 
     # UTF-16BE Notification Strings
     s_init        = "Sincronizando controle, aguarde...".encode("utf-16-be") + b"\x00\x00"
@@ -303,8 +365,8 @@ def patch_binary(base_bytes: bytes, ref_ptbr_bytes: bytes = None) -> bytearray:
     data[OFF_STR_FOUND:OFF_STR_FOUND+len(s_found)] = s_found
     data[OFF_STR_ASK_MAP:OFF_STR_ASK_MAP+len(s_ask_map)] = s_ask_map
 
-    # Clear has_run latch at VA 0x81F43BF0 (file offset 0x34BF0 in .data)
-    data[OFF_HAS_RUN_DATA:OFF_HAS_RUN_DATA+4] = bytes(4)
+    # Clear has_run latch (0x81F43BF0) and combo hold counter (0x81F43BF4) in .data
+    data[OFF_HAS_RUN_DATA:OFF_HAS_RUN_DATA+8] = bytes(8)
 
     # 5. R5: Native iPega PG-9076 / ShanWan (VID 0x2563, PID 0x0575) Static Mapping
     print("[-] Applying R5: Native iPega PG-9076 (VID 0x2563, PID 0x0575) Static Mapping...")
@@ -356,25 +418,28 @@ def verify_patched_binary(data: bytearray) -> bool:
     c800 = struct.unpack(">I", data[0x0c800:0x0c804])[0]
     assert c800 == 0x48000064, f"R1 Failed: Expected 0x48000064 at 0x0c800, got {hex(c800)}"
 
+    ord_patch = struct.unpack(">I", data[0x0c3b8:0x0c3bc])[0]
+    assert ord_patch == 0x3880037a, f"R1 Failed: Expected 0x3880037a at 0x0c3b8, got {hex(ord_patch)}"
+
     # R2 Verification
     ov = struct.unpack(">I", data[0x0922c:0x09230])[0]
     assert ov == 0x480004a8, f"R2 Failed: Expected 0x480004a8 at 0x0922c, got {hex(ov)}"
 
-    # R3 Threading, Stack Frame & Latch Verification
+    # R3 Threading, Stack Frame, Combo Hook & Latch Verification
     thook = struct.unpack(">I", data[0x0a628:0x0a62c])[0]
     assert thook == 0x48022489, f"R3 Failed: Expected 0x48022489 at 0x0a628, got {hex(thook)}"
 
+    chook = struct.unpack(">I", data[0x0a648:0x0a64c])[0]
+    assert chook == make_bl(0x0a648, 0x2cc50), f"R3 Failed: Unexpected combo hook at 0x0a648: {hex(chook)}"
+
     cave_start = struct.unpack(">I", data[0x2cab0:0x2cab4])[0]
-    assert cave_start == 0x7d8802a6, f"R3 Failed: Cave must start with mflr r0 (0x7d8802a6), got {hex(cave_start)}"
+    assert cave_start == 0x3d6081f4, f"R3 Failed: Cave must start with lis r11, 0x81f4 (0x3d6081f4), got {hex(cave_start)}"
 
-    stk_alloc = struct.unpack(">I", data[0x2cab8:0x2cabc])[0]
-    assert stk_alloc == 0x9421ffc0, f"R3 Failed: Cave must allocate stack (0x9421ffc0), got {hex(stk_alloc)}"
+    prologue_mflr = struct.unpack(">I", data[0x2cac8:0x2cacc])[0]
+    assert prologue_mflr == 0x7d8802a6, f"R3 Failed: Expected mflr r12 (0x7d8802a6) at 0x2cac8, got {hex(prologue_mflr)}"
 
-    orig_ins = struct.unpack(">I", data[0x2cabc:0x2cac0])[0]
-    assert orig_ins == 0x7f9de378, f"R3 Failed: Cave must restore mr r29, r27 (0x7f9de378), got {hex(orig_ins)}"
-
-    latch_load = struct.unpack(">I", data[0x2cac4:0x2cac8])[0]
-    assert latch_load == 0x814b3bf0, f"R3 Failed: Cave must load 0x3bf0(r11), got {hex(latch_load)}"
+    prologue_stwu = struct.unpack(">I", data[0x2cacc:0x2cad0])[0]
+    assert prologue_stwu == 0x9421ffb0, f"R3 Failed: Expected stwu r1, -0x50(r1) at 0x2cacc, got {hex(prologue_stwu)}"
 
     latch_val = struct.unpack(">I", data[0x34bf0:0x34bf4])[0]
     assert latch_val == 0, f"R3 Failed: has_run at 0x34bf0 must be 0, got {latch_val}"
@@ -446,14 +511,8 @@ def deploy_to_console(source_xex: str, target_root: str):
         return
 
     dest_xex = os.path.join(target_root, "hiddriver.xex")
-    bak_xex = os.path.join(target_root, "hiddriver.xex.bak_pre_v8")
-
     print(f"[-] Deploying to console target: {dest_xex}")
     try:
-        if os.path.exists(dest_xex) and not os.path.exists(bak_xex):
-            shutil.copy2(dest_xex, bak_xex)
-            print(f"[+] Created safety backup at {bak_xex}")
-
         shutil.copy2(source_xex, dest_xex)
         print(f"[+] Successfully deployed {dest_xex}!")
     except Exception as e:
@@ -471,7 +530,7 @@ def main():
     output_packaged = os.path.join(workspace, "hiddriver.xex")
 
     print("=================================================================")
-    print("  Xbox 360 hiddriver360 Safe Auto-Recognition Build (v8 Final)   ")
+    print("  Xbox 360 hiddriver360 Safe Auto-Recognition Build (v9 Final)   ")
     print("=================================================================")
 
     if not os.path.exists(base_file):
